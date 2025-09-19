@@ -37,7 +37,7 @@ export class EmbeddingService {
           new Field("id", new Utf8()),
           new Field(
             "embedding",
-            new FixedSizeList(5120, new Field("float32", new Float32())),
+            new FixedSizeList(1536, new Field("float32", new Float32())),  // VLM2Vec-Qwen2VL-2B outputs 1536
           ),
           new Field("text", new Utf8()),
           new Field("imageUrl", new Utf8()),
