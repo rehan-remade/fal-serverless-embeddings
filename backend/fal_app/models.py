@@ -34,3 +34,20 @@ class VLM2VecEmbeddingResponse(BaseModel):
     dimension: int = Field(
         description="Embedding dimension"
     )
+
+
+class BatchVideoIngestionRequest(BaseModel):
+    """Request model for batch video ingestion"""
+    videos: List[dict] = Field(
+        description="List of video objects with url and prompt"
+    )
+    batch_size: int = Field(
+        default=10,
+        description="Number of videos to process in parallel"
+    )
+
+class BatchVideoIngestionResponse(BaseModel):
+    """Response model for batch video ingestion"""
+    processed: int = Field(description="Number of videos processed")
+    failed: int = Field(description="Number of videos that failed")
+    errors: List[dict] = Field(default_factory=list, description="List of errors")

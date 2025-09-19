@@ -4,15 +4,17 @@ import sys
 import tempfile
 import traceback
 import uuid
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Dict
 import json  # Add this import
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fal
 from fal.toolkit import FAL_PERSISTENT_DIR
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import LocalEntryNotFoundError
 from fastapi import HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from fal_app.constants import (
     EXAMPLE_TEXT,
@@ -22,6 +24,8 @@ from fal_app.constants import (
 from fal_app.models import (
     VLM2VecEmbeddingRequest,
     VLM2VecEmbeddingResponse,
+    BatchVideoIngestionRequest,
+    BatchVideoIngestionResponse,
 )
 
 import io
@@ -420,9 +424,9 @@ class VLM2Vec(fal.App):
                 else:
                     raise ValueError("At least one input (text, image_url, or video_url) must be provided")
                 
-                # Convert to list
-                # Fix: Convert bfloat16 to float32 before numpy conversion
-                embedding = output.cpu().float().numpy().flatten().tolist()
+                # Convert to Python list for JSON serialization
+                # Fix: Detach from computation graph before converting to numpy
+                embedding = output.detach().cpu().float().numpy().flatten().tolist()
                 return embedding
                 
         except Exception as e:
@@ -455,6 +459,77 @@ class VLM2Vec(fal.App):
     ) -> VLM2VecEmbeddingResponse:
         """Default endpoint for embedding generation"""
         return await self.embed(input, request, response)
+
+
+    @fal.endpoint("/batch-ingest")
+    async def batch_ingest(
+        self,
+        input: BatchVideoIngestionRequest,
+        request: Request,
+        response: Response
+    ) -> BatchVideoIngestionResponse:
+        """Batch process videos for embedding generation"""
+        
+        processed = 0
+        failed = 0
+        errors = []
+        
+        print(f"Starting batch ingestion of {len(input.videos)} videos")
+        
+        # Process in batches
+        for i in range(0, len(input.videos), input.batch_size):
+            batch = input.videos[i:i + input.batch_size]
+            print(f"Processing batch {i//input.batch_size + 1}: videos {i} to {i + len(batch)}")
+            
+            # Process videos in parallel within each batch
+            batch_tasks = []
+            for video_data in batch:
+                video_url = video_data.get('url', video_data.get('video_url'))
+                prompt = video_data.get('prompt', video_data.get('text', ''))
+                
+                if not video_url:
+                    errors.append({
+                        'video': video_data,
+                        'error': 'No video URL provided'
+                    })
+                    failed += 1
+                    continue
+                
+                # Create embedding request
+                embedding_request = VLM2VecEmbeddingRequest(
+                    video_url=video_url,
+                    text=prompt,
+                    max_pixels=input.max_pixels if hasattr(input, 'max_pixels') else 360 * 420,
+                    fps=input.fps if hasattr(input, 'fps') else 1.0
+                )
+                
+                batch_tasks.append((video_data, embedding_request))
+            
+            # Process batch concurrently
+            for video_data, embedding_request in batch_tasks:
+                try:
+                    embedding = await self.generate_embedding(embedding_request)
+                    processed += 1
+                    print(f"✓ Processed video: {video_data.get('id', 'unknown')}")
+                except Exception as e:
+                    failed += 1
+                    error_msg = f"Failed to process video {video_data.get('id', 'unknown')}: {str(e)}"
+                    print(f"✗ {error_msg}")
+                    errors.append({
+                        'video': video_data,
+                        'error': str(e)
+                    })
+                
+                # Add a small delay to avoid overwhelming the system
+                await asyncio.sleep(0.1)
+        
+        print(f"Batch ingestion complete: {processed} processed, {failed} failed")
+        
+        return BatchVideoIngestionResponse(
+            processed=processed,
+            failed=failed,
+            errors=errors
+        )
 
 
 if __name__ == "__main__":

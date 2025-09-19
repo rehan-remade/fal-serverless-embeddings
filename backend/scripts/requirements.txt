@@ -1,0 +1,6 @@
+aiohttp
+lancedb
+pyarrow
+numpy
+tqdm
+python-dotenv
