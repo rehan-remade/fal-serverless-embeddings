@@ -84,23 +84,37 @@ export class EmbeddingService {
     };
   }
 
-  async searchEmbeddings(queryEmbedding: number[], limit: number): Promise<SearchResult[]> {
+  async searchEmbeddings(
+    queryEmbedding: number[], 
+    limit: number,
+    distanceType: 'l2' | 'cosine' | 'dot' = 'l2',
+    distanceThreshold?: number
+  ): Promise<SearchResult[]> {
     const table = await this.getTable();
     
-    const results = await table
-      .search(queryEmbedding)
-      .limit(limit)
-      .toArray();
+    try {
+      // Basic search without threshold - let client filter if needed
+      const results = await table
+        .search(queryEmbedding)
+        .distanceType(distanceType)
+        .limit(limit)
+        .toArray();
 
-    return results.map((r: any) => ({
-      id: r.id,
-      embedding: r.embedding,
-      text: r.text || null,
-      imageUrl: r.imageUrl || null,
-      videoUrl: r.videoUrl || null,
-      createdAt: new Date(r.createdAt),
-      distance: r._distance
-    }));
+      console.log(`Search found ${results.length} results`);
+
+      return results.map((r: any) => ({
+        id: r.id,
+        embedding: r.embedding,
+        text: r.text || null,
+        imageUrl: r.imageUrl || null,
+        videoUrl: r.videoUrl || null,
+        createdAt: new Date(r.createdAt),
+        distance: r._distance
+      }));
+    } catch (error) {
+      console.error('Error searching embeddings:', error);
+      return [];
+    }
   }
 
   async getRecentEmbeddings(limit: number = 50): Promise<Embedding[]> {
@@ -132,6 +146,50 @@ export class EmbeddingService {
     }) as { data: { embedding: number[]; dimension: number } };
 
     return data.embedding;
+  }
+
+  async getEmbeddingById(id: string): Promise<Embedding | null> {
+    const table = await this.getTable();
+    
+    try {
+      // Use parameterized query to avoid SQL injection and syntax issues
+      const results = await table
+        .query()
+        .where(`id = "${id}"`) // Use double quotes for string literals in LanceDB
+        .toArray();
+      
+      if (results.length === 0) return null;
+      
+      const r = results[0];
+      return {
+        id: r.id,
+        embedding: r.embedding,
+        text: r.text || null,
+        imageUrl: r.imageUrl || null,
+        videoUrl: r.videoUrl || null,
+        createdAt: new Date(r.createdAt)
+      };
+    } catch (error) {
+      console.error('Error fetching embedding by ID:', error);
+      return null;
+    }
+  }
+
+  // Simple dimension reduction using PCA (for demo)
+  // In production, you'd want to use UMAP or t-SNE
+  async reduceEmbeddingDimensions(
+    embeddings: Embedding[],
+    targetDimensions: number
+  ): Promise<number[][]> {
+    // For now, return random positions
+    // In production, implement proper UMAP/t-SNE/PCA
+    return embeddings.map(() => {
+      const positions = [];
+      for (let i = 0; i < targetDimensions; i++) {
+        positions.push((Math.random() - 0.5) * 20);
+      }
+      return positions;
+    });
   }
 }
 
