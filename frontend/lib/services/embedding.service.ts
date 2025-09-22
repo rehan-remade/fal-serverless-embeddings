@@ -175,6 +175,37 @@ export class EmbeddingService {
     }
   }
 
+  async getRandomEmbeddings(limit: number = 50): Promise<Embedding[]> {
+    const table = await this.getTable();
+    
+    try {
+      // Query all records
+      const allRecords = await table.query().toArray();
+      
+      // Shuffle array using Fisher-Yates algorithm
+      const shuffled = [...allRecords];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      
+      // Return limited random results
+      return shuffled
+        .slice(0, limit)
+        .map((r: any) => ({
+          id: r.id,
+          embedding: r.embedding,
+          text: r.text || null,
+          imageUrl: r.imageUrl || null,
+          videoUrl: r.videoUrl || null,
+          createdAt: new Date(r.createdAt)
+        }));
+    } catch (error) {
+      console.error('Error fetching random embeddings:', error);
+      return [];
+    }
+  }
+
   // Simple dimension reduction using PCA (for demo)
   // In production, you'd want to use UMAP or t-SNE
   async reduceEmbeddingDimensions(

@@ -10,8 +10,41 @@ import {
 } from '@/lib/schemas/embedding.schema';
 import { embeddingService } from '../../lib/services/embedding.service';
 import { TRPCError } from '@trpc/server';
+import { fal } from '@fal-ai/client';
 
 export const embeddingRouter = router({
+  uploadVideo: publicProcedure
+    .input(z.object({
+      fileBase64: z.string(),
+      fileName: z.string(),
+      mimeType: z.string()
+    }))
+    .output(z.object({
+      url: z.string()
+    }))
+    .mutation(async ({ input }) => {
+      try {
+        // Convert base64 to buffer
+        const buffer = Buffer.from(input.fileBase64, 'base64');
+        
+        // Create a Blob from the buffer
+        const blob = new Blob([buffer], { type: input.mimeType });
+        
+        // Create a File object
+        const file = new File([blob], input.fileName, { type: input.mimeType });
+        
+        // Upload to fal.storage
+        const url = await fal.storage.upload(file);
+        
+        return { url };
+      } catch (error) {
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: error instanceof Error ? error.message : 'Failed to upload video',
+        });
+      }
+    }),
+
   create: publicProcedure
     .input(createEmbeddingSchema)
     .output(z.object({
@@ -37,7 +70,14 @@ export const embeddingRouter = router({
   search: publicProcedure
     .input(searchEmbeddingsSchema)
     .output(z.object({
-      results: z.array(embeddingSchema.extend({ distance: z.number() }))
+      results: z.array(z.object({
+        id: z.string(),
+        text: z.string().nullable(),
+        imageUrl: z.string().nullable(), 
+        videoUrl: z.string().nullable(),
+        createdAt: z.date(),
+        distance: z.number()
+      }))
     }))
     .mutation(async ({ input }: { input: SearchEmbeddingsInput }) => {
       try {
@@ -51,7 +91,17 @@ export const embeddingRouter = router({
         // Search
         const results = await embeddingService.searchEmbeddings(queryEmbedding, input.limit);
 
-        return { results };
+        // Return results without the embedding array
+        return { 
+          results: results.map(r => ({
+            id: r.id,
+            text: r.text,
+            imageUrl: r.imageUrl,
+            videoUrl: r.videoUrl,
+            createdAt: r.createdAt,
+            distance: r.distance
+          }))
+        };
       } catch (error) {
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
@@ -207,6 +257,41 @@ export const embeddingRouter = router({
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: error instanceof Error ? error.message : 'Failed to get video positions',
+        });
+      }
+    }),
+
+  getRandom: publicProcedure
+    .input(z.object({
+      limit: z.number().min(1).max(100).default(50)
+    }))
+    .output(z.object({
+      embeddings: z.array(z.object({
+        id: z.string(),
+        text: z.string().nullable(),
+        imageUrl: z.string().nullable(),
+        videoUrl: z.string().nullable(),
+        createdAt: z.date()
+      }))
+    }))
+    .query(async ({ input }) => {
+      try {
+        const embeddings = await embeddingService.getRandomEmbeddings(input.limit);
+        
+        // Return without embedding arrays to avoid serialization issues
+        return {
+          embeddings: embeddings.map(e => ({
+            id: e.id,
+            text: e.text,
+            imageUrl: e.imageUrl,
+            videoUrl: e.videoUrl,
+            createdAt: e.createdAt
+          }))
+        };
+      } catch (error) {
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: error instanceof Error ? error.message : 'Failed to fetch random embeddings',
         });
       }
     })
