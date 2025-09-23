@@ -347,69 +347,80 @@ class VLM2Vec(fal.App):
                     os.unlink(video_path)
                     
                 elif input.image_url:
-                    print("Processing image...")
-                    # Download and process image
+                    print("Processing image via 2-frame video...")
+                    # Download image
                     async with aiohttp.ClientSession() as session:
                         async with session.get(input.image_url) as response:
                             print(f"Image download status: {response.status}")
                             print(f"Image content type: {response.headers.get('content-type')}")
                             image_data = await response.read()
                             print(f"Image size: {len(image_data)} bytes")
-                            image = Image.open(io.BytesIO(image_data)).convert('RGB')
-                            print(f"Image dimensions: {image.size}")
-                            print(f"Image mode: {image.mode}")
-                    
-                    # Try using the same approach as video processing
-                    messages = [{
-                        "role": "user", 
-                        "content": [
-                            {
-                                "type": "image",
-                                "image": image,  # Pass PIL Image directly
-                                "max_pixels": input.max_pixels,
-                            },
-                            {"type": "text", "text": input.text or "Represent the given image."},
-                        ],
-                    }]
-                    
-                    print(f"Messages structure: {json.dumps([{**m, 'content': [{'type': c['type']} if 'type' in c else c for c in m['content']]} for m in messages], indent=2)}")
-                    
+
+                    # Build a minimal 2-frame MP4 from the image
+                    import numpy as np
+                    import cv2
+
+                    image = Image.open(io.BytesIO(image_data)).convert('RGB')
+                    frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                    h, w = frame_bgr.shape[:2]
+
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+                        temp_video_path = tmp.name
+
+                    fps = max(1.0, float(input.fps or 1.0))
+                    vw = cv2.VideoWriter(temp_video_path, fourcc, fps, (w, h))
+                    vw.write(frame_bgr)
+                    vw.write(frame_bgr)  # ensure at least 2 frames
+                    vw.release()
+
                     try:
+                        messages = [{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "video",
+                                    "video": temp_video_path,
+                                    "max_pixels": input.max_pixels,
+                                    "fps": fps,
+                                },
+                                {"type": "text", "text": input.text or "Represent the given image."},
+                            ],
+                        }]
+                        print(f"Messages structure: {json.dumps(messages, indent=2)}")
+
                         image_inputs, video_inputs = self.process_vision_info(messages)
-                        print(f"Image inputs type: {type(image_inputs)}, length: {len(image_inputs) if hasattr(image_inputs, '__len__') else 'N/A'}")
-                        print(f"Video inputs: {video_inputs}")
-                        
-                        # Process with images parameter
+                        print(f"Video inputs type: {type(video_inputs)}")
+
                         inputs = self.processor(
-                            text=input.text or "Represent the given image.",
-                            images=image_inputs if image_inputs else [image],
+                            text=f'{self.VLM_VIDEO_TOKENS[self.QWEN2_VL]} Represent the given image.',
+                            videos=video_inputs,
                             return_tensors="pt"
                         )
-                    except Exception as e:
-                        print(f"Error in process_vision_info: {e}")
-                        print("Falling back to direct image processing")
-                        inputs = self.processor(
-                            text=input.text or "Represent the given image.",
-                            images=[image],
-                            return_tensors="pt"
-                        )
-                    
-                    print("Processor output keys:", inputs.keys())
-                    for key, value in inputs.items():
-                        if hasattr(value, 'shape'):
-                            print(f"  {key}: shape {value.shape}, dtype {value.dtype}")
-                        else:
-                            print(f"  {key}: {type(value)}")
-                    
-                    inputs = {key: value.to(self.device) for key, value in inputs.items()}
-                    
-                    print("About to call model with inputs:")
-                    for key, value in inputs.items():
-                        if hasattr(value, 'shape'):
-                            print(f"  {key}: shape {value.shape} on device {value.device}")
-                    
-                    output = self.model(qry=inputs)["qry_reps"]
-                    
+
+                        print("Processor output keys:", inputs.keys())
+                        for key, value in inputs.items():
+                            if hasattr(value, 'shape'):
+                                print(f"  {key}: shape {value.shape}, dtype {value.dtype}")
+                            else:
+                                print(f"  {key}: {type(value)}")
+
+                        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+                        inputs['pixel_values_videos'] = inputs['pixel_values_videos'].unsqueeze(0)
+                        inputs['video_grid_thw'] = inputs['video_grid_thw'].unsqueeze(0)
+
+                        print("After unsqueeze:")
+                        for key, value in inputs.items():
+                            if hasattr(value, 'shape'):
+                                print(f"  {key}: shape {value.shape} on device {value.device}")
+
+                        output = self.model(qry=inputs)["qry_reps"]
+                    finally:
+                        try:
+                            os.unlink(temp_video_path)
+                        except Exception:
+                            pass
+
                 elif input.text:
                     print("Processing text only...")
                     # Process text only

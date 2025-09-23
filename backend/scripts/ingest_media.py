@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import glob
 from typing import List, Dict, Any, Optional
 import aiohttp
 from datetime import datetime
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-class VideoIngestionPipeline:
+class MediaIngestionPipeline:
     def __init__(self, fal_endpoint: str, fal_key: str, lancedb_uri: str, lancedb_api_key: str):
         self.fal_endpoint = fal_endpoint
         self.fal_key = fal_key
@@ -46,7 +47,6 @@ class VideoIngestionPipeline:
         
         if "embeddings" not in tables:
             # Create table with the correct schema
-            # Note: We'll determine the actual embedding dimension from the first response
             schema = pa_schema([
                 pa_field("id", string()),
                 pa_field("embedding", pa_list_(float32(), 1536)),  # VLM2Vec-Qwen2VL-2B outputs 1536
@@ -65,11 +65,11 @@ class VideoIngestionPipeline:
             self.table = await self.db.open_table("embeddings")
             print("Opened existing table: embeddings")
     
-    async def generate_embedding(self, video_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Generate embedding for a single video"""
+    async def generate_embedding(self, media_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Generate embedding for a single image or video"""
         try:
             # Extract prompt from metadata
-            metadata = json.loads(video_data.get('metadata', '{}'))
+            metadata = json.loads(media_data.get('metadata', '{}'))
             prompt = metadata.get('prompt', {})
             
             if isinstance(prompt, dict):
@@ -77,24 +77,35 @@ class VideoIngestionPipeline:
             else:
                 prompt_text = str(prompt)
             
-            # Skip if no video URL
-            output_url = video_data.get('output_url', '')
+            # Get output URL
+            output_url = media_data.get('output_url', '')
             if not output_url:
                 return None
             
-            # Check if it's a video file (mp4, webm, mov, etc.)
-            valid_video_extensions = ['.mp4', '.webm', '.mov', '.avi', '.mkv']
-            if not any(output_url.lower().endswith(ext) for ext in valid_video_extensions):
-                print(f"Skipping non-video file: {output_url}")
+            # Determine if it's an image or video
+            image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff']
+            video_extensions = ['.mp4', '.webm', '.mov', '.avi', '.mkv']
+            
+            is_image = any(output_url.lower().endswith(ext) for ext in image_extensions)
+            is_video = any(output_url.lower().endswith(ext) for ext in video_extensions)
+            
+            if not is_image and not is_video:
+                print(f"Skipping unknown file type: {output_url}")
                 return None
-                
+            
             # Prepare request for FAL app
             request_data = {
-                "video_url": output_url,
                 "text": prompt_text,
                 "max_pixels": 360 * 420,
                 "fps": 1.0
             }
+            
+            if is_image:
+                request_data["image_url"] = output_url
+                media_type = "image"
+            else:
+                request_data["video_url"] = output_url
+                media_type = "video"
             
             # Call FAL app to generate embedding
             async with self.session.post(
@@ -111,51 +122,46 @@ class VideoIngestionPipeline:
                     embedding = result['embedding']
                     
                     # Debug: Check embedding dimension
-                    print(f"Embedding dimension for video {video_data.get('id')}: {len(embedding)}")
-                    
-                    # Verify correct dimension
-                    if len(embedding) != 1536:
-                        print(f"WARNING: Expected 1536 dimensions, got {len(embedding)}")
-                        # You might want to pad or truncate here if needed
+                    print(f"✓ {media_type} {media_data.get('id')}: embedding dimension {len(embedding)}")
                     
                     return {
-                        "id": str(video_data.get('idx', video_data.get('id', ''))),
+                        "id": str(media_data.get('idx', media_data.get('id', ''))),
                         "embedding": embedding,
                         "text": prompt_text,
-                        "imageUrl": "",  # Empty since this is for videos
-                        "videoUrl": output_url,
+                        "imageUrl": output_url if is_image else "",
+                        "videoUrl": output_url if is_video else "",
                         "createdAt": datetime.fromisoformat(
-                            video_data.get('created_at', '').replace('+00', '')
-                        ).timestamp() if video_data.get('created_at') else datetime.now().timestamp(),
+                            media_data.get('created_at', '').replace('+00', '')
+                        ).timestamp() if media_data.get('created_at') else datetime.now().timestamp(),
                     }
                 else:
-                    print(f"Error for video {video_data.get('id')}: {response.status}")
+                    print(f"✗ Error for {media_type} {media_data.get('id')}: {response.status}")
                     error_text = await response.text()
-                    print(f"Error details: {error_text[:200]}")
+                    print(f"  Error details: {error_text[:200]}")
                     return None
                     
         except Exception as e:
-            print(f"Exception for video {video_data.get('id')}: {str(e)}")
+            print(f"✗ Exception for {media_type} {media_data.get('id')}: {str(e)}")
             return None
     
-    async def process_batch(self, videos: List[Dict[str, Any]], batch_size: int = 5) -> Dict[str, int]:
-        """Process a batch of videos"""
+    async def process_batch(self, media_items: List[Dict[str, Any]], batch_size: int = 5) -> Dict[str, int]:
+        """Process a batch of media items"""
         results = {"success": 0, "failed": 0, "skipped": 0}
         embeddings_to_insert = []
         
         # Process in smaller concurrent batches
-        for i in range(0, len(videos), batch_size):
-            batch = videos[i:i + batch_size]
+        for i in range(0, len(media_items), batch_size):
+            batch = media_items[i:i + batch_size]
             
             # Create tasks for concurrent processing
-            tasks = [self.generate_embedding(video) for video in batch]
+            tasks = [self.generate_embedding(item) for item in batch]
             
             # Wait for all tasks in batch to complete
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            for video, result in zip(batch, batch_results):
+            for item, result in zip(batch, batch_results):
                 if isinstance(result, Exception):
-                    print(f"Error processing video {video.get('id')}: {result}")
+                    print(f"Error processing media {item.get('id')}: {result}")
                     results["failed"] += 1
                 elif result is None:
                     results["skipped"] += 1
@@ -180,96 +186,118 @@ class VideoIngestionPipeline:
         
         return results
     
-    async def ingest_from_json(self, json_path: str, limit: Optional[int] = None, 
-                              batch_size: int = 5, filter_platform: Optional[str] = None):
-        """Ingest videos from JSON file"""
-        # Load JSON data with UTF-8 encoding
-        with open(json_path, 'r', encoding='utf-8') as f:
-            videos = json.load(f)
+    async def ingest_from_json_files(self, json_pattern: str, limit: Optional[int] = None, 
+                                   batch_size: int = 5, filter_platform: Optional[str] = None):
+        """Ingest media from multiple JSON files"""
+        # Find all matching JSON files
+        json_files = sorted(glob.glob(json_pattern))
         
-        print(f"Loaded {len(videos)} records from {json_path}")
+        if not json_files:
+            print(f"No files found matching pattern: {json_pattern}")
+            return {"success": 0, "failed": 0, "skipped": 0}
         
-        # Filter videos
-        filtered_videos = []
-        skipped_images = 0
+        print(f"Found {len(json_files)} JSON files to process:")
+        for file in json_files:
+            print(f"  - {file}")
         
-        for video in videos:
+        all_media = []
+        
+        # Load all JSON files
+        for json_path in json_files:
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    items = json.load(f)
+                print(f"Loaded {len(items)} records from {json_path}")
+                all_media.extend(items)
+            except Exception as e:
+                print(f"Error loading {json_path}: {e}")
+        
+        print(f"\nTotal records loaded: {len(all_media)}")
+        
+        # Filter media items
+        filtered_media = []
+        
+        for item in all_media:
             # Skip if no output URL
-            output_url = video.get('output_url', '')
+            output_url = item.get('output_url', '')
             if not output_url:
                 continue
                 
-            # Skip image files
-            image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff']
-            if any(output_url.lower().endswith(ext) for ext in image_extensions):
-                skipped_images += 1
-                continue
-            
-            # Skip non-video files that aren't images either
-            video_extensions = ['.mp4', '.webm', '.mov', '.avi', '.mkv']
-            if not any(output_url.lower().endswith(ext) for ext in video_extensions):
-                print(f"Skipping unknown file type: {output_url}")
-                continue
-                
-            # Skip failed/error videos
-            if video.get('status') != 'completed' or video.get('error'):
+            # Skip failed/error items
+            if item.get('status') != 'completed' or item.get('error'):
                 continue
                 
             # Apply platform filter if specified
-            if filter_platform and video.get('platform') != filter_platform:
+            if filter_platform and item.get('platform') != filter_platform:
                 continue
                 
-            filtered_videos.append(video)
+            filtered_media.append(item)
         
-        print(f"Filtered to {len(filtered_videos)} completed videos")
-        print(f"Skipped {skipped_images} image files")
+        print(f"Filtered to {len(filtered_media)} completed items")
         
         # Apply limit if specified
         if limit:
-            filtered_videos = filtered_videos[:limit]
-            print(f"Limited to {limit} videos")
+            filtered_media = filtered_media[:limit]
+            print(f"Limited to {limit} items")
         
-        # Group by platform for stats
+        # Group by platform and media type for stats
         platform_counts = defaultdict(int)
         file_type_counts = defaultdict(int)
+        media_type_counts = {"images": 0, "videos": 0, "unknown": 0}
         
-        for video in filtered_videos:
-            platform_counts[video.get('platform', 'unknown')] += 1
-            # Count file types
-            url = video.get('output_url', '')
+        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff']
+        video_extensions = ['.mp4', '.webm', '.mov', '.avi', '.mkv']
+        
+        for item in filtered_media:
+            platform_counts[item.get('platform', 'unknown')] += 1
+            
+            # Count file types and media types
+            url = item.get('output_url', '')
             extension = os.path.splitext(url.lower())[1]
             file_type_counts[extension] += 1
+            
+            if any(url.lower().endswith(ext) for ext in image_extensions):
+                media_type_counts["images"] += 1
+            elif any(url.lower().endswith(ext) for ext in video_extensions):
+                media_type_counts["videos"] += 1
+            else:
+                media_type_counts["unknown"] += 1
         
-        print("\nVideos by platform:")
+        print("\nItems by platform:")
         for platform, count in platform_counts.items():
             print(f"  {platform}: {count}")
             
-        print("\nVideos by file type:")
+        print("\nItems by media type:")
+        for media_type, count in media_type_counts.items():
+            print(f"  {media_type}: {count}")
+            
+        print("\nItems by file extension:")
         for file_type, count in file_type_counts.items():
             print(f"  {file_type}: {count}")
         
-        # Process videos
+        # Process media items
         print(f"\nStarting processing with batch size {batch_size}...")
-        results = await self.process_batch(filtered_videos, batch_size)
+        results = await self.process_batch(filtered_media, batch_size)
         
         return results
 
-async def main():
-    parser = argparse.ArgumentParser(description='Ingest videos and generate embeddings')
-    parser.add_argument('json_path', help='Path to JSON file with video data')
 
+async def main():
+    parser = argparse.ArgumentParser(description='Ingest images and videos to generate embeddings')
+    parser.add_argument('json_pattern', help='Pattern for JSON files (e.g., "generation_rows*.json")')
+    
     parser.add_argument('--fal-endpoint', default=os.getenv('FAL_ENDPOINT'), help='FAL endpoint URL')
     parser.add_argument('--fal-key', default=os.getenv('FAL_KEY'), help='FAL API key')
     parser.add_argument('--lancedb-uri', default=os.getenv('LANCEDB_URI'), help='LanceDB URI')
     parser.add_argument('--lancedb-key', default=os.getenv('LANCEDB_API_KEY'), help='LanceDB API key')
-
-    parser.add_argument('--limit', type=int, help='Limit number of videos to process')
+    
+    parser.add_argument('--limit', type=int, help='Limit number of items to process')
     parser.add_argument('--batch-size', type=int, default=5, help='Batch size for concurrent processing')
     parser.add_argument('--platform', choices=['fal', 'vertex_ai'], help='Filter by platform')
     
     args = parser.parse_args()
     
-    async with VideoIngestionPipeline(
+    async with MediaIngestionPipeline(
         fal_endpoint=args.fal_endpoint,
         fal_key=args.fal_key,
         lancedb_uri=args.lancedb_uri,
@@ -277,8 +305,8 @@ async def main():
     ) as pipeline:
         start_time = datetime.now()
         
-        results = await pipeline.ingest_from_json(
-            json_path=args.json_path,
+        results = await pipeline.ingest_from_json_files(
+            json_pattern=args.json_pattern,
             limit=args.limit,
             batch_size=args.batch_size,
             filter_platform=args.platform
@@ -294,7 +322,8 @@ async def main():
         print(f"Success: {results['success']}")
         print(f"Failed: {results['failed']}")
         print(f"Skipped: {results['skipped']}")
-        print(f"Rate: {results['success'] / duration:.2f} videos/second" if duration > 0 else "N/A")
+        print(f"Rate: {results['success'] / duration:.2f} items/second" if duration > 0 else "N/A")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
