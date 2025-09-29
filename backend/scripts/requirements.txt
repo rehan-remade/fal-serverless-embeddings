@@ -4,3 +4,8 @@ pyarrow
 numpy
 tqdm
 python-dotenv
+datasets
+fal
+huggingface_hub
+opencv-python
+Pillow
