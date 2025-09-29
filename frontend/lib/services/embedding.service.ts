@@ -117,13 +117,13 @@ export class EmbeddingService {
     }
   }
 
-  async getRecentEmbeddings(limit: number = 50): Promise<Embedding[]> {
+  async getRecentEmbeddings(limit: number = 50, offset: number = 0): Promise<{ embeddings: Embedding[], total: number }> {
     const table = await this.getTable();
     
     // Query all records and sort by createdAt
     const allRecords = await table.query().toArray();
     
-    return allRecords
+    const sorted = allRecords
       .map((r: any) => ({
         id: r.id,
         embedding: r.embedding,
@@ -132,8 +132,12 @@ export class EmbeddingService {
         videoUrl: r.videoUrl || null,
         createdAt: new Date(r.createdAt)
       }))
-      .sort((a: any, b: any) => b.createdAt.getTime() - a.createdAt.getTime())
-      .slice(0, limit);
+      .sort((a: any, b: any) => b.createdAt.getTime() - a.createdAt.getTime());
+    
+    return {
+      embeddings: sorted.slice(offset, offset + limit),
+      total: sorted.length
+    };
   }
 
   async generateQueryEmbedding(input: Omit<CreateEmbeddingInput, 'metadata'>): Promise<number[]> {
@@ -203,6 +207,19 @@ export class EmbeddingService {
     } catch (error) {
       console.error('Error fetching random embeddings:', error);
       return [];
+    }
+  }
+
+  async deleteEmbedding(id: string): Promise<boolean> {
+    const table = await this.getTable();
+    
+    try {
+      // Delete the record with the given ID
+      await table.delete(`id = "${id}"`);
+      return true;
+    } catch (error) {
+      console.error('Error deleting embedding:', error);
+      return false;
     }
   }
 

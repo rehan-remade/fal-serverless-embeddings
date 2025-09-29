@@ -112,15 +112,33 @@ export const embeddingRouter = router({
 
   list: publicProcedure
     .input(z.object({
-      limit: z.number().min(1).max(100).default(50)
+      limit: z.number().min(1).max(100).default(50),
+      offset: z.number().min(0).default(0)
     }))
     .output(z.object({
-      embeddings: z.array(embeddingSchema)
+      embeddings: z.array(z.object({
+        id: z.string(),
+        text: z.string().nullable(),
+        imageUrl: z.string().nullable(),
+        videoUrl: z.string().nullable(),
+        createdAt: z.date()
+      })),
+      total: z.number()
     }))
-    .query(async ({ input }: { input: ListEmbeddingsInput }) => {
+    .query(async ({ input }) => {
       try {
-        const embeddings = await embeddingService.getRecentEmbeddings(input.limit);
-        return { embeddings };
+        const result = await embeddingService.getRecentEmbeddings(input.limit, input.offset);
+        
+        return { 
+          embeddings: result.embeddings.map(e => ({
+            id: e.id,
+            text: e.text,
+            imageUrl: e.imageUrl,
+            videoUrl: e.videoUrl,
+            createdAt: e.createdAt
+          })),
+          total: result.total
+        };
       } catch (error) {
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
@@ -292,6 +310,37 @@ export const embeddingRouter = router({
         throw new TRPCError({
           code: 'INTERNAL_SERVER_ERROR',
           message: error instanceof Error ? error.message : 'Failed to fetch random embeddings',
+        });
+      }
+    }),
+
+  delete: publicProcedure
+    .input(z.object({
+      id: z.string()
+    }))
+    .output(z.object({
+      success: z.boolean(),
+      message: z.string()
+    }))
+    .mutation(async ({ input }) => {
+      try {
+        const success = await embeddingService.deleteEmbedding(input.id);
+        
+        if (success) {
+          return {
+            success: true,
+            message: 'Embedding deleted successfully'
+          };
+        } else {
+          throw new TRPCError({
+            code: 'INTERNAL_SERVER_ERROR',
+            message: 'Failed to delete embedding'
+          });
+        }
+      } catch (error) {
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: error instanceof Error ? error.message : 'Failed to delete embedding',
         });
       }
     })
