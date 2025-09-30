@@ -202,7 +202,7 @@ export const embeddingRouter = router({
         createdAt: z.date()
       }))
     }))
-    .query(async ({ input }) => {
+    .mutation(async ({ input }) => {
       try {
         const embeddings = await embeddingService.getRandomEmbeddings(input.limit);
         
