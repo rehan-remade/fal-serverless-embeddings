@@ -1,23 +1,21 @@
 import asyncio
 import os
-import tempfile
-import shutil
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import aiohttp
 from datetime import datetime
 import lancedb
 from pyarrow import schema as pa_schema, field as pa_field, float32, string, float64, list_ as pa_list_
-import numpy as np
 from tqdm.asyncio import tqdm
 import argparse
 from dotenv import load_dotenv
 from datasets import load_dataset
-import json
+import time
+import random
 
 load_dotenv()
 
 
-class VideoDatasetIngestionPipeline:
+class PexelsVideoIngestionPipeline:
     def __init__(self, fal_endpoint: str, fal_key: str, lancedb_uri: str, lancedb_api_key: str):
         self.fal_endpoint = fal_endpoint
         self.fal_key = fal_key
@@ -27,9 +25,20 @@ class VideoDatasetIngestionPipeline:
         self.table = None
         self.session = None
         
+        # Rate limiting tracking
+        self.rate_limit_reset_time = None
+        self.consecutive_429s = 0
+        
+        # Cache for existing video IDs
+        self.existing_video_ids = set()
+        
+        # Set FAL API key for fal_client
+        os.environ["FAL_KEY"] = fal_key
+        
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
         await self.connect_db()
+        await self.load_existing_video_ids()
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -67,156 +76,195 @@ class VideoDatasetIngestionPipeline:
             self.table = await self.db.open_table("embeddings")
             print("Opened existing table: embeddings")
     
-    async def upload_to_file_io(self, video_path: str) -> Optional[str]:
-        """Upload video to file.io (temporary file hosting) and return URL"""
+    async def load_existing_video_ids(self):
+        """Load all existing video IDs from the database"""
+        print("Loading existing video IDs from database...")
         try:
-            with open(video_path, 'rb') as f:
-                files = {'file': f}
-                async with self.session.post('https://file.io', data=files) as response:
+            # Query all records that start with 'pexels_'
+            results = await self.table.search() \
+                .select(["id"]) \
+                .where("id LIKE 'pexels_%'") \
+                .to_list()
+            
+            # Extract video IDs
+            for result in results:
+                self.existing_video_ids.add(result['id'])
+            
+            print(f"Found {len(self.existing_video_ids)} existing Pexels videos in database")
+        except Exception as e:
+            print(f"Error loading existing IDs (might be empty table): {e}")
+            # If table is empty or error, continue with empty set
+            self.existing_video_ids = set()
+    
+    async def is_video_processed(self, video_id: str) -> bool:
+        """Check if a video has already been processed"""
+        pexels_id = f"pexels_{video_id}"
+        return pexels_id in self.existing_video_ids
+
+    async def check_video_url_accessibility(self, video_url: str) -> bool:
+        """Check if video URL is accessible before sending to FAL"""
+        try:
+            async with self.session.head(video_url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                # Check if we're being rate limited
+                if response.status == 429:
+                    self.consecutive_429s += 1
+                    print(f"\n⚠️ Rate limited by Pexels (429). Consecutive 429s: {self.consecutive_429s}")
+                    return False
+                
+                # Reset counter on successful request
+                self.consecutive_429s = 0
+                
+                # Check if content type is video
+                content_type = response.headers.get('content-type', '')
+                if response.status == 200 and ('video' in content_type or 'octet-stream' in content_type):
+                    return True
+                    
+                print(f"  ⚠️ Invalid response: status={response.status}, content-type={content_type}")
+                return False
+                
+        except Exception as e:
+            print(f"  ⚠️ Error checking video URL: {str(e)}")
+            return False
+
+    async def generate_embedding_with_retry(self, video_url: str, caption: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        """Generate embedding with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                # Prepare request for FAL app
+                request_data = {
+                    "video_url": video_url,
+                    "text": caption,
+                    "max_pixels": 360 * 420,
+                    "fps": 1.0
+                }
+                
+                # Call FAL app to generate embedding
+                async with self.session.post(
+                    f"{self.fal_endpoint}/embed",
+                    json=request_data,
+                    headers={
+                        "Authorization": f"Key {self.fal_key}",
+                        "Content-Type": "application/json"
+                    },
+                    timeout=aiohttp.ClientTimeout(total=300)
+                ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        if result.get('success'):
-                            return result['link']
-            return None
-        except Exception as e:
-            print(f"Error uploading to file.io: {e}")
-            return None
-    
-    async def generate_embedding(self, video_url: str, caption: str) -> Optional[Dict[str, Any]]:
-        """Generate embedding for a video URL with caption using your FAL endpoint"""
-        try:
-            # Prepare request for FAL app
-            request_data = {
-                "video_url": video_url,
-                "text": caption,
-                "max_pixels": 360 * 420,
-                "fps": 1.0
-            }
-            
-            # Call FAL app to generate embedding
-            async with self.session.post(
-                f"{self.fal_endpoint}/embed",
-                json=request_data,
-                headers={
-                    "Authorization": f"Key {self.fal_key}",
-                    "Content-Type": "application/json"
-                },
-                timeout=aiohttp.ClientTimeout(total=300)
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    embedding = result['embedding']
-                    
-                    return {
-                        "embedding": embedding,
-                        "text": caption,
-                        "videoUrl": video_url,
-                    }
-                else:
-                    print(f"✗ Error generating embedding: {response.status}")
-                    error_text = await response.text()
-                    print(f"  Error details: {error_text[:200]}")
-                    return None
-                    
-        except Exception as e:
-            print(f"✗ Exception generating embedding: {str(e)}")
-            return None
-    
-    async def process_video_entry(self, video_path: str, video_id: str, captions: List[str], dataset_name: str) -> Dict[str, int]:
-        """Process a single video with its captions"""
-        results = {"success": 0, "failed": 0}
-        
-        try:
-            # Upload video to temporary storage
-            print(f"Uploading video {video_id} to temporary storage...")
-            video_url = await self.upload_to_file_io(video_path)
-            
-            if not video_url:
-                print(f"✗ Failed to upload video {video_id}, skipping...")
-                results["failed"] += len(captions[:3])
-                return results
-            
-            print(f"✓ Uploaded video to: {video_url}")
-            
-            # Generate embeddings for captions
-            embeddings_to_insert = []
-            captions_to_process = captions[:3]  # Process fewer captions for testing
-            
-            for i, caption in enumerate(captions_to_process):
-                try:
-                    print(f"  Processing caption {i+1}/{len(captions_to_process)}: {caption[:50]}...")
-                    
-                    embedding_data = await self.generate_embedding(video_url, caption)
-                    
-                    if embedding_data:
-                        record = {
-                            "id": f"{dataset_name}_{video_id}_caption_{i}",
-                            "embedding": embedding_data["embedding"],
-                            "text": caption,
-                            "imageUrl": "",
-                            "videoUrl": video_url,
-                            "createdAt": datetime.now().timestamp(),
-                        }
-                        embeddings_to_insert.append(record)
-                        results["success"] += 1
-                    else:
-                        results["failed"] += 1
+                        embedding = result['embedding']
                         
-                except Exception as e:
-                    print(f"    ✗ Exception: {str(e)}")
-                    results["failed"] += 1
-                
-                await asyncio.sleep(0.5)
-            
-            # Insert embeddings
-            if embeddings_to_insert:
-                try:
-                    await self.table.add(embeddings_to_insert)
-                    print(f"✓ Inserted {len(embeddings_to_insert)} embeddings")
-                except Exception as e:
-                    print(f"✗ Error inserting: {e}")
-                    results["failed"] += len(embeddings_to_insert)
-                    results["success"] -= len(embeddings_to_insert)
+                        return {
+                            "embedding": embedding,
+                            "text": caption,
+                            "videoUrl": video_url,
+                        }
+                    elif response.status == 500:
+                        # Internal server error might be due to invalid video data
+                        error_text = await response.text()
+                        if "429" in error_text or "Invalid data found" in error_text:
+                            print(f"  ⚠️ FAL endpoint received invalid video data (likely rate limited HTML)")
+                            return None
+                        print(f"  ✗ FAL Error ({response.status}): {error_text[:200]}")
+                        
+                        # Retry with exponential backoff
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            print(f"  ⏳ Retrying in {wait_time} seconds...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                    else:
+                        print(f"  ✗ Error generating embedding: {response.status}")
+                        error_text = await response.text()
+                        print(f"  Error details: {error_text[:200]}")
                     
-        except Exception as e:
-            print(f"✗ Error processing video {video_id}: {str(e)}")
-            results["failed"] += len(captions[:3])
-            
-        return results
-    
-    def find_video_file(self, video_path: str) -> Optional[str]:
-        """Find video file in various possible locations"""
-        # If it's already a valid path, return it
-        if os.path.exists(video_path):
-            return video_path
-        
-        # Common HuggingFace cache locations
-        hf_cache_dirs = [
-            os.path.expanduser("~/.cache/huggingface/datasets"),
-            os.path.expanduser("~/.cache/huggingface/hub"),
-            os.path.expanduser("~/.cache/huggingface/datasets/downloads"),
-            os.path.expanduser("~/.cache/huggingface/datasets/extracted"),
-        ]
-        
-        # Try to find the file in cache directories
-        for cache_dir in hf_cache_dirs:
-            if os.path.exists(cache_dir):
-                # Search recursively for the video file
-                for root, dirs, files in os.walk(cache_dir):
-                    if os.path.basename(video_path) in files:
-                        full_path = os.path.join(root, os.path.basename(video_path))
-                        if os.path.exists(full_path):
-                            return full_path
+                    return None
+                        
+            except Exception as e:
+                print(f"  ✗ Exception generating embedding: {str(e)}")
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"  ⏳ Retrying in {wait_time} seconds...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                return None
         
         return None
     
-    async def ingest_dataset(self, dataset_name: str, split: str = "train", limit: Optional[int] = None):
-        """Ingest video dataset from HuggingFace"""
-        print(f"Loading {dataset_name} dataset (split: {split})...")
+    async def process_pexels_video_with_semaphore(
+        self, 
+        semaphore: asyncio.Semaphore,
+        rate_limiter: asyncio.Semaphore,
+        video_url: str, 
+        video_id: str, 
+        title: str, 
+        thumbnail_url: str,
+        idx: int,
+        total: int
+    ) -> Dict[str, int]:
+        """Process a single Pexels video with concurrency and rate limiting control"""
+        async with semaphore:
+            # Check if video already processed
+            if await self.is_video_processed(video_id):
+                print(f"\n[{idx+1}/{total}] Skipping already processed video {video_id}")
+                return {"success": 0, "failed": 0, "skipped": 1}
+            
+            # Additional rate limiting to prevent hitting Pexels limits
+            async with rate_limiter:
+                results = {"success": 0, "failed": 0, "skipped": 0}
+                
+                try:
+                    print(f"\n[{idx+1}/{total}] Processing video {video_id}")
+                    print(f"  Title: {title[:50]}...")
+                    
+                    embedding_data = await self.generate_embedding_with_retry(video_url, title)
+                    
+                    if embedding_data:
+                        record = {
+                            "id": f"pexels_{video_id}",
+                            "embedding": embedding_data["embedding"],
+                            "text": title,
+                            "imageUrl": thumbnail_url,  # Use thumbnail URL
+                            "videoUrl": video_url,
+                            "createdAt": datetime.now().timestamp(),
+                        }
+                        
+                        # Insert embedding
+                        try:
+                            await self.table.add([record])
+                            print(f"  ✓ Success: {title[:50]}...")
+                            results["success"] += 1
+                            # Add to cache
+                            self.existing_video_ids.add(f"pexels_{video_id}")
+                        except Exception as e:
+                            print(f"  ✗ Error inserting: {e}")
+                            results["failed"] += 1
+                    else:
+                        print(f"  ✗ Failed to generate embedding")
+                        results["failed"] += 1
+                        
+                except Exception as e:
+                    print(f"  ✗ Error processing video: {str(e)}")
+                    results["failed"] += 1
+                    
+                # Add delay between requests to avoid rate limiting
+                await asyncio.sleep(0.5)  # 500ms between requests
+                    
+                return results
+
+    async def ingest_pexels_dataset(
+        self, 
+        limit: Optional[int] = None, 
+        duration_limit: int = 10, 
+        concurrency: int = 5,
+        requests_per_minute: int = 60,
+        randomize: bool = True
+    ):
+        """Ingest Pexels-400k dataset with concurrent processing and rate limiting"""
+        print(f"Loading Pexels-400k dataset...")
         
         # Load dataset
         try:
-            ds = load_dataset(dataset_name, split=split, trust_remote_code=True)
+            # Pexels dataset doesn't have splits, so we use "train"
+            ds = load_dataset("jovianzm/Pexels-400k", split="train", trust_remote_code=True)
             
             # Print first example to understand structure
             if len(ds) > 0:
@@ -224,10 +272,10 @@ class VideoDatasetIngestionPipeline:
                 print("\nFirst example structure:")
                 for key, value in first_example.items():
                     print(f"  {key}: {type(value)}")
-                    if isinstance(value, dict):
-                        print(f"    Keys: {list(value.keys())}")
-                    elif isinstance(value, str):
+                    if isinstance(value, str):
                         print(f"    Value (truncated): {value[:100]}...")
+                    else:
+                        print(f"    Value: {value}")
                         
         except Exception as e:
             print(f"Error loading dataset: {e}")
@@ -236,112 +284,125 @@ class VideoDatasetIngestionPipeline:
         
         print(f"\nDataset loaded: {len(ds)} entries")
         
-        if limit:
-            ds = ds.select(range(min(limit, len(ds))))
-            print(f"Limited to {len(ds)} entries")
+        # Filter by duration (10 seconds or less)
+        print(f"Filtering videos by duration (<= {duration_limit} seconds)...")
+        filtered_ds = [ex for ex in ds if ex.get('duration', float('inf')) <= duration_limit]
+        print(f"Filtered to {len(filtered_ds)} videos (<= {duration_limit}s)")
         
-        total_results = {"success": 0, "failed": 0}
+        # Randomize if requested
+        if randomize:
+            print("Randomizing dataset order...")
+            random.shuffle(filtered_ds)
         
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for idx, example in enumerate(tqdm(ds, desc="Processing videos")):
-                # Handle different dataset structures
-                if dataset_name == "friedrichor/MSR-VTT":
-                    video_id = example.get('video_id', f"video_{idx}")
-                    video_data = example.get('video', None)
-                    captions = [example.get('caption', "")]  # MSR-VTT might have single caption
-                elif dataset_name == "VLM2Vec/MSVD":
-                    video_id = example['video_id']
-                    video_data = example['video']
-                    captions = example['caption']
-                else:
-                    # Generic handling
-                    video_id = example.get('video_id', example.get('id', f"video_{idx}"))
-                    video_data = example.get('video', example.get('video_path', None))
-                    captions = example.get('caption', example.get('captions', []))
-                    if isinstance(captions, str):
-                        captions = [captions]
+        # Apply limit if specified
+        if limit and limit < len(filtered_ds):
+            filtered_ds = filtered_ds[:limit]
+            print(f"Limited to {len(filtered_ds)} entries")
+        
+        print(f"\nProcessing with concurrency: {concurrency}")
+        print(f"Rate limit: {requests_per_minute} requests/minute")
+        print(f"Randomization: {'ON' if randomize else 'OFF'}")
+        
+        # Create semaphores for concurrency and rate limiting
+        concurrency_semaphore = asyncio.Semaphore(concurrency)
+        
+        # Create a rate limiter that allows requests_per_minute
+        rate_limit_delay = 60.0 / requests_per_minute
+        
+        class RateLimiter:
+            def __init__(self, delay):
+                self.delay = delay
+                self.last_request = 0
                 
-                print(f"\nProcessing video {idx+1}/{len(ds)}: {video_id}")
-                print(f"  Captions: {len(captions)}")
-                print(f"  Video data type: {type(video_data)}")
+            async def __aenter__(self):
+                now = time.time()
+                time_since_last = now - self.last_request
+                if time_since_last < self.delay:
+                    await asyncio.sleep(self.delay - time_since_last)
+                self.last_request = time.time()
                 
-                # Save video to temporary file
-                video_path = os.path.join(temp_dir, f"{video_id}.mp4")
-                
-                try:
-                    # Handle different types of video data
-                    if isinstance(video_data, str):
-                        # Video data is a file path
-                        found_path = self.find_video_file(video_data)
-                        if found_path:
-                            shutil.copy(found_path, video_path)
-                        else:
-                            print(f"  Video file not found: {video_data}")
-                            continue
-                            
-                    elif isinstance(video_data, bytes):
-                        with open(video_path, 'wb') as f:
-                            f.write(video_data)
-                            
-                    elif hasattr(video_data, 'read'):
-                        # If it's a file-like object
-                        with open(video_path, 'wb') as f:
-                            f.write(video_data.read())
-                            
-                    elif isinstance(video_data, dict):
-                        # Handle dict structures
-                        if 'bytes' in video_data:
-                            with open(video_path, 'wb') as f:
-                                f.write(video_data['bytes'])
-                        elif 'path' in video_data:
-                            found_path = self.find_video_file(video_data['path'])
-                            if found_path:
-                                shutil.copy(found_path, video_path)
-                            else:
-                                print(f"  Video file not found: {video_data['path']}")
-                                continue
-                        else:
-                            print(f"  Unknown video data dict structure: {list(video_data.keys())}")
-                            continue
-                    else:
-                        print(f"  Unsupported video data type: {type(video_data)}")
-                        continue
-                    
-                    # Verify file was created and has content
-                    if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
-                        print(f"  Video file is empty or wasn't created")
-                        continue
-                    
-                    # Process video
-                    dataset_short_name = dataset_name.split('/')[-1].lower()
-                    results = await self.process_video_entry(video_path, video_id, captions, dataset_short_name)
-                    total_results["success"] += results["success"]
-                    total_results["failed"] += results["failed"]
-                    
-                except Exception as e:
-                    print(f"  Error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    total_results["failed"] += 1
-                
-                await asyncio.sleep(1)
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+        
+        rate_limiter = RateLimiter(rate_limit_delay)
+        
+        # Prepare all tasks
+        tasks = []
+        skipped_no_url = 0
+        skipped_existing = 0
+        
+        for idx, example in enumerate(filtered_ds):
+            video_url = example.get('video', '')
+            title = example.get('title', '')
+            thumbnail_url = example.get('thumbnail', '')
+            duration = example.get('duration', 0)
+            
+            # Extract video ID from URL
+            video_id = video_url.split('/')[-1] if '/' in video_url else f"video_{idx}"
+            
+            # Skip if no video URL
+            if not video_url:
+                skipped_no_url += 1
+                continue
+            
+            # Quick check if already processed (before creating task)
+            if await self.is_video_processed(video_id):
+                skipped_existing += 1
+                continue
+            
+            # Create task for concurrent processing
+            task = self.process_pexels_video_with_semaphore(
+                concurrency_semaphore,
+                rate_limiter,
+                video_url,
+                video_id,
+                title,
+                thumbnail_url,
+                idx,
+                len(filtered_ds)
+            )
+            tasks.append(task)
+        
+        print(f"\nPre-filtered results:")
+        print(f"  - Skipped {skipped_existing} already processed videos")
+        print(f"  - Skipped {skipped_no_url} videos without URLs")
+        print(f"  - Will process {len(tasks)} new videos")
+        
+        if len(tasks) == 0:
+            print("\nNo new videos to process!")
+            return {"success": 0, "failed": 0, "skipped": skipped_existing + skipped_no_url}
+        
+        # Process all tasks concurrently with progress bar
+        print(f"\nStarting concurrent processing of {len(tasks)} videos...")
+        
+        # Use tqdm to show overall progress
+        results_list = []
+        for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing videos"):
+            result = await coro
+            results_list.append(result)
+        
+        # Aggregate results
+        total_results = {"success": 0, "failed": 0, "skipped": skipped_no_url + skipped_existing}
+        for result in results_list:
+            total_results["success"] += result["success"]
+            total_results["failed"] += result["failed"]
+            total_results["skipped"] += result.get("skipped", 0)
         
         return total_results
 
 
 async def main():
-    parser = argparse.ArgumentParser(description='Ingest video dataset to generate embeddings')
+    parser = argparse.ArgumentParser(description='Ingest Pexels-400k videos to generate embeddings')
     
-    parser.add_argument('--dataset', default='VLM2Vec/MSVD', 
-                       help='Dataset name (e.g., VLM2Vec/MSVD, friedrichor/MSR-VTT)')
     parser.add_argument('--fal-endpoint', default=os.getenv('FAL_ENDPOINT'), help='FAL endpoint URL')
     parser.add_argument('--fal-key', default=os.getenv('FAL_KEY'), help='FAL API key')
     parser.add_argument('--lancedb-uri', default=os.getenv('LANCEDB_URI'), help='LanceDB URI')
     parser.add_argument('--lancedb-key', default=os.getenv('LANCEDB_API_KEY'), help='LanceDB API key')
-    
-    parser.add_argument('--split', default='test', choices=['train', 'validation', 'test'], 
-                       help='Dataset split to process')
-    parser.add_argument('--limit', type=int, default=5, help='Limit number of videos')
+    parser.add_argument('--limit', type=int, default=5, help='Limit number of videos to process')
+    parser.add_argument('--duration-limit', type=int, default=10, help='Maximum video duration in seconds')
+    parser.add_argument('--concurrency', type=int, default=3, help='Number of concurrent requests (default: 3)')
+    parser.add_argument('--rate-limit', type=int, default=30, help='Requests per minute (default: 30)')
+    parser.add_argument('--no-randomize', action='store_true', help='Disable randomization of video order')
     
     args = parser.parse_args()
     
@@ -350,7 +411,7 @@ async def main():
         print("  FAL_ENDPOINT, FAL_KEY, LANCEDB_URI, LANCEDB_API_KEY")
         return
     
-    async with VideoDatasetIngestionPipeline(
+    async with PexelsVideoIngestionPipeline(
         fal_endpoint=args.fal_endpoint,
         fal_key=args.fal_key,
         lancedb_uri=args.lancedb_uri,
@@ -358,23 +419,27 @@ async def main():
     ) as pipeline:
         start_time = datetime.now()
         
-        results = await pipeline.ingest_dataset(
-            dataset_name=args.dataset,
-            split=args.split,
-            limit=args.limit
+        results = await pipeline.ingest_pexels_dataset(
+            limit=args.limit,
+            duration_limit=args.duration_limit,
+            concurrency=args.concurrency,
+            requests_per_minute=args.rate_limit,
+            randomize=not args.no_randomize
         )
         
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
         
         print(f"\n{'='*50}")
-        print("VIDEO DATASET INGESTION COMPLETE")
+        print("PEXELS VIDEO INGESTION COMPLETE")
         print(f"{'='*50}")
-        print(f"Dataset: {args.dataset}")
-        print(f"Split: {args.split}")
+        print(f"Concurrency: {args.concurrency}")
+        print(f"Rate limit: {args.rate_limit} requests/minute")
+        print(f"Randomization: {'OFF' if args.no_randomize else 'ON'}")
         print(f"Duration: {duration:.2f} seconds")
         print(f"Success: {results['success']} embeddings")
         print(f"Failed: {results['failed']} embeddings")
+        print(f"Skipped: {results['skipped']} videos")
         print(f"Rate: {results['success'] / duration:.2f} embeddings/second" if duration > 0 else "N/A")
 
 

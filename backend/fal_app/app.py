@@ -140,7 +140,11 @@ def clone_vlm2vec_repo(commit_hash: str = "main") -> str:
         raise
 
 
-class VLM2Vec(fal.App):
+class VLM2Vec(
+    fal.App,
+    min_concurrency=1,
+    max_concurrency=5,
+):
     """VLM2Vec-V2.0 fal serverless app for multimodal embedding generation"""
     
     machine_type = ["GPU-A100"]
