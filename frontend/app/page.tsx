@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { trpc } from '@/lib/trpc/client';
 import { toast } from 'sonner';
 import { Input } from '@/components/ui/input';
@@ -16,23 +16,82 @@ export default function VideoSearch() {
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   
+  // Track if we're in search mode or random mode
+  const [isInSearchMode, setIsInSearchMode] = useState(false);
+  
+  // Track loaded video IDs to avoid duplicates
+  const loadedVideoIds = useRef<Set<string>>(new Set());
+  
   // Track previous search values to avoid duplicate searches
   const previousSearchRef = useRef({ query: '', videoUrl: null as string | null });
 
-  // Fetch random videos on mount - disable refetch on window focus
-  const { data: randomVideos, isLoading: isLoadingRandom } = trpc.embedding.getRandom.useQuery(
-    { limit: 50 },
-    {
-      refetchOnWindowFocus: false,
-      refetchOnMount: false,
-      refetchOnReconnect: false,
-      staleTime: Infinity,
+  // Initial batch size and increment
+  const INITIAL_LOAD = 50;
+  const LOAD_MORE_COUNT = 30;
+
+  // Mutation for initial random videos load
+  const initialRandomMutation = trpc.embedding.getRandom.useMutation({
+    onSuccess: (data: any) => {
+      console.log('Initial random videos loaded:', data.embeddings.slice(0, 3)); // Debug: check first 3 items
+      console.log('Video URLs:', data.embeddings.map((e: any) => ({ id: e.id, videoUrl: e.videoUrl, imageUrl: e.imageUrl })).slice(0, 5));
+      
+      loadedVideoIds.current.clear();
+      data.embeddings.forEach((video: any) => loadedVideoIds.current.add(video.id));
+      
+      setSearchResults(data.embeddings.map((e: any) => ({
+        ...e,
+        distance: Math.random() * 0.5
+      })));
+      setIsInitialLoading(false);
+    },
+    onError: (error) => {
+      console.error('Initial load error:', error);
+      toast.error('Failed to load videos');
+      setIsInitialLoading(false);
     }
-  );
+  });
+
+  // Load initial random videos on mount
+  useEffect(() => {
+    initialRandomMutation.mutate({ limit: INITIAL_LOAD });
+  }, []); // Only run once on mount
+
+  // Mutation for loading more random videos
+  const loadMoreRandomMutation = trpc.embedding.getRandom.useMutation({
+    onSuccess: (data: any) => {
+      // Filter out already loaded videos
+      const newVideos = data.embeddings.filter(
+        (video: any) => !loadedVideoIds.current.has(video.id)
+      );
+      
+      if (newVideos.length === 0) {
+        setHasMore(false);
+      } else {
+        // Add new IDs to loaded set
+        newVideos.forEach((video: any) => loadedVideoIds.current.add(video.id));
+        
+        // Append new videos with random distances
+        setSearchResults(prev => [
+          ...prev,
+          ...newVideos.map((e: any) => ({
+            ...e,
+            distance: Math.random() * 0.5
+          }))
+        ]);
+      }
+      setIsLoadingMore(false);
+    },
+    onError: (error) => {
+      console.error('Load more error:', error);
+      setIsLoadingMore(false);
+    }
+  });
 
   // Upload mutation
   const uploadMutation = trpc.embedding.uploadVideo.useMutation({
@@ -51,8 +110,15 @@ export default function VideoSearch() {
   // TRPC mutation for search
   const searchMutation = trpc.embedding.search.useMutation({
     onSuccess: (data) => {
+      // Clear loaded IDs when new search
+      loadedVideoIds.current.clear();
+      data.results.forEach(video => loadedVideoIds.current.add(video.id));
+      
       setSearchResults(data.results);
       setIsSearching(false);
+      setIsInSearchMode(true);
+      // For now, disable loading more in search mode since backend doesn't support pagination
+      setHasMore(false);
     },
     onError: (error) => {
       toast.error('Search failed: ' + error.message);
@@ -60,16 +126,77 @@ export default function VideoSearch() {
     }
   });
 
+  // Mutation for loading more search results
+  const loadMoreSearchMutation = trpc.embedding.search.useMutation({
+    onSuccess: (data) => {
+      // Filter out already loaded videos
+      const newVideos = data.results.filter(
+        video => !loadedVideoIds.current.has(video.id)
+      );
+      
+      if (newVideos.length === 0) {
+        setHasMore(false);
+      } else {
+        // Add new IDs to loaded set
+        newVideos.forEach(video => loadedVideoIds.current.add(video.id));
+        
+        // Append new videos, sorted by distance
+        setSearchResults(prev => {
+          const combined = [...prev, ...newVideos];
+          // Sort by distance to maintain order
+          return combined.sort((a, b) => (a.distance || 0) - (b.distance || 0));
+        });
+      }
+      setIsLoadingMore(false);
+    },
+    onError: (error) => {
+      console.error('Load more search error:', error);
+      setIsLoadingMore(false);
+    }
+  });
+
+  // Handle infinite scroll
+  const handleScroll = useCallback(() => {
+    if (isLoadingMore || !hasMore || isSearching || isInitialLoading) return;
+
+    const scrollHeight = document.documentElement.scrollHeight;
+    const scrollTop = document.documentElement.scrollTop;
+    const clientHeight = document.documentElement.clientHeight;
+
+    // Start loading when user is 80% down the page
+    if (scrollTop + clientHeight >= scrollHeight * 0.8) {
+      setIsLoadingMore(true);
+
+      if (isInSearchMode && (searchQuery.trim() || uploadedVideoUrl)) {
+        // Load more search results
+        // Note: Since backend doesn't support offset, we'll request more and filter client-side
+        loadMoreSearchMutation.mutate({
+          text: searchQuery.trim() || undefined,
+          videoUrl: uploadedVideoUrl || undefined,
+          limit: searchResults.length + LOAD_MORE_COUNT
+        });
+      } else {
+        // Load more random videos
+        loadMoreRandomMutation.mutate({ limit: LOAD_MORE_COUNT });
+      }
+    }
+  }, [isLoadingMore, hasMore, isSearching, isInitialLoading, isInSearchMode, searchQuery, uploadedVideoUrl, searchResults.length]);
+
+  // Add scroll event listener
+  useEffect(() => {
+    window.addEventListener('scroll', handleScroll);
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, [handleScroll]);
+
   // Debounce search as user types
   useEffect(() => {
-    // If clearing search, show random videos
+    // If clearing search, reload initial random videos
     if (!searchQuery.trim() && !uploadedVideoUrl) {
-      if (randomVideos?.embeddings) {
-        setSearchResults(randomVideos.embeddings.map(e => ({
-          ...e,
-          distance: Math.random() * 0.5
-        })));
-      }
+      setIsInSearchMode(false);
+      setHasMore(true);
+      
+      // Reload initial random videos
+      initialRandomMutation.mutate({ limit: INITIAL_LOAD });
       return;
     }
 
@@ -88,12 +215,12 @@ export default function VideoSearch() {
       searchMutation.mutate({
         text: searchQuery.trim() || undefined,
         videoUrl: uploadedVideoUrl || undefined,
-        limit: 20
+        limit: 50 // Start with more results for search
       });
     }, 800);
 
     return () => clearTimeout(timer);
-  }, [searchQuery, uploadedVideoUrl, randomVideos]);
+  }, [searchQuery, uploadedVideoUrl]);
 
   // Handle file upload
   const handleFileUpload = async (file: File) => {
@@ -146,18 +273,6 @@ export default function VideoSearch() {
     }
   };
 
-  useEffect(() => {
-    if (randomVideos && !searchQuery && !uploadedVideoUrl) {
-      setSearchResults(randomVideos.embeddings.map(e => ({
-        ...e,
-        distance: Math.random() * 0.5
-      })));
-    }
-    if (!isLoadingRandom) {
-      setIsInitialLoading(false);
-    }
-  }, [randomVideos, isLoadingRandom, searchQuery, uploadedVideoUrl]);
-
   return (
     <div className="min-h-screen bg-background text-foreground relative">
       {/* Powered by Fal Badge */}
@@ -189,6 +304,13 @@ export default function VideoSearch() {
           results={searchResults} 
           isLoading={(isSearching || isInitialLoading) && searchResults.length === 0}
         />
+
+        {/* Loading more indicator */}
+        {isLoadingMore && (
+          <div className="flex justify-center py-8">
+            <Loader2 className="w-8 h-8 animate-spin text-primary" />
+          </div>
+        )}
 
         {/* Empty state */}
         {!isSearching && !isInitialLoading && searchResults.length === 0 && (searchQuery || uploadedVideoUrl) && (
