@@ -1,16 +1,13 @@
 'use client';
 
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { trpc } from '@/lib/trpc/client';
 import { toast } from 'sonner';
 import { Input } from '@/components/ui/input';
-import { Loader2, Upload, Search, X, Play, Video } from 'lucide-react';
+import { Loader2, Upload, Search, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { PoweredByFalBadge } from '@/components/powered-by-fal-badge';
-import { VideoItem } from '@/components/video-item';
-import { LoadingGrid } from '@/components/loading-grid';
 import { VideoGallery } from '@/components/video-gallery';
-import { Navigation } from '@/components/navigation';
 
 export default function VideoSearch() {
   const [searchQuery, setSearchQuery] = useState('');
@@ -163,9 +160,6 @@ export default function VideoSearch() {
 
   return (
     <div className="min-h-screen bg-background text-foreground relative">
-      {/* Navigation */}
-      <Navigation />
-      
       {/* Powered by Fal Badge */}
       <PoweredByFalBadge />
 

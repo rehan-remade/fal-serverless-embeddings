@@ -3,10 +3,8 @@ import { router, publicProcedure } from '@/server/trpc';
 import { 
   createEmbeddingSchema, 
   searchEmbeddingsSchema,
-  embeddingSchema,
   CreateEmbeddingInput,
-  SearchEmbeddingsInput,
-  ListEmbeddingsInput
+  SearchEmbeddingsInput
 } from '@/lib/schemas/embedding.schema';
 import { embeddingService } from '../../lib/services/embedding.service';
 import { TRPCError } from '@trpc/server';
@@ -110,43 +108,6 @@ export const embeddingRouter = router({
       }
     }),
 
-  list: publicProcedure
-    .input(z.object({
-      limit: z.number().min(1).max(100).default(50),
-      offset: z.number().min(0).default(0)
-    }))
-    .output(z.object({
-      embeddings: z.array(z.object({
-        id: z.string(),
-        text: z.string().nullable(),
-        imageUrl: z.string().nullable(),
-        videoUrl: z.string().nullable(),
-        createdAt: z.date()
-      })),
-      total: z.number()
-    }))
-    .query(async ({ input }) => {
-      try {
-        const result = await embeddingService.getRecentEmbeddings(input.limit, input.offset);
-        
-        return { 
-          embeddings: result.embeddings.map(e => ({
-            id: e.id,
-            text: e.text,
-            imageUrl: e.imageUrl,
-            videoUrl: e.videoUrl,
-            createdAt: e.createdAt
-          })),
-          total: result.total
-        };
-      } catch (error) {
-        throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: error instanceof Error ? error.message : 'Failed to fetch embeddings',
-        });
-      }
-    }),
-
   findSimilar: publicProcedure
     .input(z.object({
       videoId: z.string(),
@@ -228,57 +189,6 @@ export const embeddingRouter = router({
       }
     }),
 
-  getAllWithPositions: publicProcedure
-    .input(z.object({
-      limit: z.number().min(50).max(500).default(300),
-      dimensions: z.enum(['2d', '3d']).default('2d')
-    }))
-    .output(z.object({
-      videos: z.array(z.object({
-        id: z.string(),
-        videoUrl: z.string().nullable(),
-        text: z.string().nullable(),
-        imageUrl: z.string().nullable(),
-        position: z.array(z.number()),
-        cluster: z.number().optional()
-      })),
-      bounds: z.object({
-        min: z.array(z.number()),
-        max: z.array(z.number())
-      })
-    }))
-    .query(async ({ input }) => {
-      try {
-        const embeddings = await embeddingService.getRecentEmbeddings(input.limit);
-        
-        // Reduce dimensions using UMAP (you'll need to implement this)
-        const positions = await embeddingService.reduceEmbeddingDimensions(
-          embeddings,
-          input.dimensions === '2d' ? 2 : 3
-        );
-
-        return {
-          videos: embeddings.map((e, i) => ({
-            id: e.id,
-            videoUrl: e.videoUrl,
-            text: e.text,
-            imageUrl: e.imageUrl,
-            position: positions[i],
-            cluster: 0 // You can add clustering later
-          })),
-          bounds: {
-            min: positions.reduce((min, p) => p.map((v, i) => Math.min(v, min[i] || v))),
-            max: positions.reduce((max, p) => p.map((v, i) => Math.max(v, max[i] || v)))
-          }
-        };
-      } catch (error) {
-        throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: error instanceof Error ? error.message : 'Failed to get video positions',
-        });
-      }
-    }),
-
   getRandom: publicProcedure
     .input(z.object({
       limit: z.number().min(1).max(100).default(50)
@@ -313,35 +223,4 @@ export const embeddingRouter = router({
         });
       }
     }),
-
-  delete: publicProcedure
-    .input(z.object({
-      id: z.string()
-    }))
-    .output(z.object({
-      success: z.boolean(),
-      message: z.string()
-    }))
-    .mutation(async ({ input }) => {
-      try {
-        const success = await embeddingService.deleteEmbedding(input.id);
-        
-        if (success) {
-          return {
-            success: true,
-            message: 'Embedding deleted successfully'
-          };
-        } else {
-          throw new TRPCError({
-            code: 'INTERNAL_SERVER_ERROR',
-            message: 'Failed to delete embedding'
-          });
-        }
-      } catch (error) {
-        throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: error instanceof Error ? error.message : 'Failed to delete embedding',
-        });
-      }
-    })
 });

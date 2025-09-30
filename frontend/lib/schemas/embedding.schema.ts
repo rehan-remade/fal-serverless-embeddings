@@ -25,10 +25,6 @@ export const searchEmbeddingsSchema = z.object({
   { message: "At least one search input is required" }
 );
 
-export const listEmbeddingsSchema = z.object({
-  limit: z.number().min(1).max(100).default(50)
-});
-
 // Output schemas
 export const embeddingSchema = z.object({
   id: z.uuid(),
@@ -55,4 +51,3 @@ export type SearchEmbeddingsInput = z.infer<typeof searchEmbeddingsSchema>;
 export type Embedding = z.infer<typeof embeddingSchema>;
 export type EmbeddingResponse = z.infer<typeof embeddingResponseSchema>;
 export type SearchResult = z.infer<typeof searchResultSchema>;
-export type ListEmbeddingsInput = z.infer<typeof listEmbeddingsSchema>;

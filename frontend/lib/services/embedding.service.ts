@@ -117,29 +117,6 @@ export class EmbeddingService {
     }
   }
 
-  async getRecentEmbeddings(limit: number = 50, offset: number = 0): Promise<{ embeddings: Embedding[], total: number }> {
-    const table = await this.getTable();
-    
-    // Query all records and sort by createdAt
-    const allRecords = await table.query().toArray();
-    
-    const sorted = allRecords
-      .map((r: any) => ({
-        id: r.id,
-        embedding: r.embedding,
-        text: r.text || null,
-        imageUrl: r.imageUrl || null,
-        videoUrl: r.videoUrl || null,
-        createdAt: new Date(r.createdAt)
-      }))
-      .sort((a: any, b: any) => b.createdAt.getTime() - a.createdAt.getTime());
-    
-    return {
-      embeddings: sorted.slice(offset, offset + limit),
-      total: sorted.length
-    };
-  }
-
   async generateQueryEmbedding(input: Omit<CreateEmbeddingInput, 'metadata'>): Promise<number[]> {
     const { data } = await fal.subscribe(process.env.FAL_MODEL_ID!, {
       input: {
@@ -208,36 +185,6 @@ export class EmbeddingService {
       console.error('Error fetching random embeddings:', error);
       return [];
     }
-  }
-
-  async deleteEmbedding(id: string): Promise<boolean> {
-    const table = await this.getTable();
-    
-    try {
-      // Delete the record with the given ID
-      await table.delete(`id = "${id}"`);
-      return true;
-    } catch (error) {
-      console.error('Error deleting embedding:', error);
-      return false;
-    }
-  }
-
-  // Simple dimension reduction using PCA (for demo)
-  // In production, you'd want to use UMAP or t-SNE
-  async reduceEmbeddingDimensions(
-    embeddings: Embedding[],
-    targetDimensions: number
-  ): Promise<number[][]> {
-    // For now, return random positions
-    // In production, implement proper UMAP/t-SNE/PCA
-    return embeddings.map(() => {
-      const positions = [];
-      for (let i = 0; i < targetDimensions; i++) {
-        positions.push((Math.random() - 0.5) * 20);
-      }
-      return positions;
-    });
   }
 }
 
